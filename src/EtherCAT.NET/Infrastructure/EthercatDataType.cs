@@ -3,7 +3,7 @@ using System.Text.RegularExpressions;
 
 namespace EtherCAT.NET.Infrastructure
 {
-    class EhterCatDataTypeHelper
+    class EtherCatDataTypeHelper
     {
         public static EthercatDataType ParseEthercatDataType(string value, out int? arrayLength)
         {

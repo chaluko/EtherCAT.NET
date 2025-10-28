@@ -76,7 +76,7 @@ namespace EtherCAT.NET
             if (value == null)
                 return 0;
             else
-                return EhterCatDataTypeHelper.ParseEthercatDataType(value, out _);
+                return EtherCatDataTypeHelper.ParseEthercatDataType(value, out _);
         }
 
         public static IEnumerable<T> TrueDistinct<T>(this IEnumerable<T> inputs)

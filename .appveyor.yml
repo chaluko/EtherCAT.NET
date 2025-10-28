@@ -7,7 +7,7 @@ image:
 
 environment:
   ApiKey:
-    secure: tbd
+    secure: 7Zs5sA5Xf8nBMwRpTa/vKpyDea/nW1MBYAmObl679uQ=
   SatelliteJobName: 'Image: Ubuntu'
   FileName: 'libsoem_wrapper.so'
 
@@ -86,7 +86,7 @@ deploy:
   - provider: NuGet
     server: https://www.nuget.org/api/v2/package
     api_key:
-      secure: tbd
+      secure: 4y2X3oy8EjI61Aoep/fZ+njBv5A+nDAt0YfTpRKF0HZwEtkB7hcoTYWNvsxWG73R
     skip_symbols: true
     artifact: /.*\.nupkg/ 
     on:

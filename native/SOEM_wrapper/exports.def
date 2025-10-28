@@ -1,4 +1,5 @@
-EXPORTS 
+EXPORTS
+    ALStatusForEachSlave
     CalculateCrc
     CheckSafeOpState
     CompensateDcDrift
@@ -34,9 +35,20 @@ EXPORTS
     RegisterSerialRxCallback
     SetTxBuffer
     UpdateSerialIo
+    UpdateSerialIoStandard
+    GetProcessIo
     RequestCommonState
+    EnablePreopAckCheck
+    SetWatchdogDividerAllSlaves
+    SetWatchdogDivider
+    SetPDIWatchdogAllSlaves
+    SetPDIWatchdog
+    SetProcessDataWatchdogAllSlaves
+    SetProcessDataWatchdog
+    RestoreProcessDataWatchdog
     ScanDevices
     SdoWrite
+    SdoEntryExists
     UpdateCsa
     UpdateIo
     UploadPdoConfig

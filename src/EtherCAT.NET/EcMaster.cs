@@ -6,12 +6,12 @@ using SOEM.PInvoke;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Linq;
 using System.Net.NetworkInformation;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
-using System.IO;
 
 namespace EtherCAT.NET
 {
@@ -55,11 +55,13 @@ namespace EtherCAT.NET
         private Task _watchdogTask;
         private bool _watchDogActive = true;
 
+        private static readonly Dictionary<ushort, GCHandle> _callbackHandles = new Dictionary<ushort, GCHandle>();
+
         #endregion
 
         #region Constructors
 
-        public EcMaster(EcSettings settings) 
+        public EcMaster(EcSettings settings)
             : this(settings, NullLogger.Instance)
         {
             //
@@ -110,7 +112,7 @@ namespace EtherCAT.NET
 
             for (int i = 0; i <= actualSlaves.Count() - 1; i++)
             {
-                if (!(actualSlaves[i].ProductCode == slaves[i].ProductCode 
+                if (!(actualSlaves[i].ProductCode == slaves[i].ProductCode
                    && actualSlaves[i].Revision == slaves[i].Revision))
                     throw new Exception(ErrorMessage.EthercatGateway_EtherCATConfigurationMismatch);
             }
@@ -118,34 +120,57 @@ namespace EtherCAT.NET
 
         private void ConfigureSlaves(IList<SlaveInfo> slaves)
         {
-            var callbacks = new List<EcHL.PO2SOCallback>();
-
             foreach (var slave in slaves)
             {
                 // SDO / PDO config / PDO assign
                 var currentSlaveIndex = (ushort)(Convert.ToUInt16(slaves.ToList().IndexOf(slave)) + 1);
-                var extensions = slave.Extensions;
+                var sdoWriteRequests = slave.GetConfiguration(slave.Extensions).ToList();
 
-                var sdoWriteRequests = slave.GetConfiguration(extensions).ToList();
+                if (_callbackHandles.TryGetValue(currentSlaveIndex, out var oldHandle))
+                {
+                    EcHL.RegisterCallback(this.Context, currentSlaveIndex, IntPtr.Zero);
+
+                    if (oldHandle.IsAllocated)
+                        oldHandle.Free();
+
+                    _callbackHandles.Remove(currentSlaveIndex);
+                }
+
+                if (sdoWriteRequests.Count == 0)
+                {
+                    EcHL.RegisterCallback(this.Context, currentSlaveIndex, IntPtr.Zero);
+                    continue;
+                }
 
                 EcHL.PO2SOCallback callback = slaveIndex =>
                 {
-                    sdoWriteRequests.ToList().ForEach(sdoWriteRequest =>
+                    foreach (var sdoWriteRequest in sdoWriteRequests)
                     {
-                        EcUtilities.CheckErrorCode(this.Context, EcUtilities.SdoWrite(this.Context, slaveIndex, sdoWriteRequest.Index, sdoWriteRequest.SubIndex, sdoWriteRequest.Dataset), nameof(EcHL.SdoWrite));
-                    });
+                        var bytes = sdoWriteRequest.Dataset.SelectMany(value => value.ToByteArray()).ToArray();
+
+                        _logger.LogInformation("SDO write for slave {SlaveIndex} at index 0x{Index:X4}/{SubIndex:X2} data {Data}",
+                            slaveIndex, sdoWriteRequest.Index, sdoWriteRequest.SubIndex, BitConverter.ToString(bytes));
+
+                        var errorCode = EcUtilities.SdoWrite(this.Context, slaveIndex, sdoWriteRequest.Index,
+                            sdoWriteRequest.SubIndex, sdoWriteRequest.Dataset);
+
+                        if (errorCode <= 0)
+                        {
+                            _logger.LogError("SDO write failed for slave {SlaveIndex} at index 0x{Index:X4}/{SubIndex:X2}",
+                                slaveIndex, sdoWriteRequest.Index, sdoWriteRequest.SubIndex);
+
+                            EcUtilities.LogErrorCode(Context, errorCode, _logger, nameof(ConfigureSlaves));
+                        }
+                    }
 
                     return 0;
                 };
 
-                EcHL.RegisterCallback(this.Context, currentSlaveIndex, callback);
-                callbacks.Add(callback);
-            }
+                var handle = GCHandle.Alloc(callback);
+                _callbackHandles[currentSlaveIndex] = handle;
 
-            callbacks.ForEach(callback =>
-            {
-                GC.KeepAlive(callback);
-            });
+                EcHL.RegisterCallback(this.Context, currentSlaveIndex, Marshal.GetFunctionPointerForDelegate(callback));
+            }
         }
 
         private void ConfigureIoMap(IList<SlaveInfo> slaves)
@@ -172,36 +197,81 @@ namespace EtherCAT.NET
                     var slaveByteOffset = slavePdoOffsets[slaves.ToList().IndexOf(slave) + 1];
 
                     // reset bit offset if byte offset changes
-                    if( slaveByteOffset != ioMapByteOffset )
+                    if (slaveByteOffset != ioMapByteOffset)
                         ioMapBitOffset = 0;
 
                     ioMapByteOffset = slaveByteOffset;
-                    
+
                     foreach (var variable in slave.DynamicData.Pdos
                         .Where(pdo => pdo.SyncManager >= 0)
                         .SelectMany(pdo => pdo.Variables)
                         .Where(variable => variable.DataDirection == dataDirection))
                     {
-                        variable.DataPtr = IntPtr.Add(_ioMapPtr, ioMapByteOffset);
-                        variable.BitOffset = ioMapBitOffset;
+                        SetSlaveVariableMapping(variable, ref ioMapBitOffset, ref ioMapByteOffset);
+                    }
 
-                        if (variable.DataType == EthercatDataType.Boolean)
-                            variable.BitOffset = ioMapBitOffset; // bool is treated as bit-oriented
-
-                        Debug.WriteLine($"{variable.Name} {variable.DataPtr.ToInt64() - _ioMapPtr.ToInt64()}/{variable.BitOffset}");
-
-                        ioMapBitOffset += variable.BitLength;
-
-                        if (ioMapBitOffset > 7)
+                    if (slave.Modules != null)
+                    {
+                        foreach (var module in slave.Modules)
                         {
-                            ioMapBitOffset = ioMapBitOffset % 8;
-                            ioMapByteOffset += (variable.BitLength + 7) / 8;
+                            foreach (var variable in module.Pdos
+                                .Where(pdo => pdo.SyncManager >= 0).ToList()
+                                .SelectMany(pdo => pdo.Variables).ToList()
+                                .Where(variable => variable.DataDirection == dataDirection))
+                            {
+                                SetSlaveVariableMapping(variable, ref ioMapBitOffset, ref ioMapByteOffset);
+                            }
                         }
                     }
                 }
             }
 
             _logger.LogInformation($"IO map configured ({slaves.Count()} {(slaves.Count() > 1 ? "slaves" : "slave")}, {_actualIoMapSize} bytes)");
+        }
+
+        private void SetSlaveVariableMapping(SlaveVariable variable, ref int ioMapBitOffset, ref int ioMapByteOffset)
+        {
+            variable.DataPtr = IntPtr.Add(_ioMapPtr, ioMapByteOffset);
+            variable.BitOffset = ioMapBitOffset;
+
+            Debug.WriteLine($"{variable.Name} {variable.DataPtr.ToInt64() - _ioMapPtr.ToInt64()}/{variable.BitOffset}");
+
+            ioMapBitOffset += variable.BitLength;
+
+            if (ioMapBitOffset > 7)
+            {
+                ioMapByteOffset += ioMapBitOffset / 8;
+                ioMapBitOffset %= 8;
+            }
+        }
+
+        private void ConfigureModules(IList<SlaveInfo> slaves)
+        {
+            foreach (var slave in slaves)
+            {
+                var slaveIndex = (ushort)(Convert.ToUInt16(slaves.ToList().IndexOf(slave)) + 1);
+                ushort sdoIndex = 0xF050; // ETG.5001 Modular Device Profile: 0xF050 - Detected Module Ident List
+                byte sdoSubIndex = 0;
+
+                if (!EcHL.SdoEntryExists(Context, slaveIndex, sdoIndex, sdoSubIndex))
+                    continue;
+
+                if (!EcUtilities.TryReadSdoValue<int>(Context, slaveIndex, sdoIndex, sdoSubIndex, out var detectedModules))
+                    throw new InvalidDataException($"Could not read Modular Device Profile length on 0x{sdoIndex:X4}:0x{sdoSubIndex:X2}");
+
+                if (detectedModules != 0)
+                {
+                    slave.Modules = new List<SlaveInfoDynamicData>();
+
+                    for (sdoSubIndex = 1; sdoSubIndex <= detectedModules; sdoSubIndex++)
+                    {
+                        if (!EcUtilities.TryReadSdoValue<int>(Context, slaveIndex, sdoIndex, sdoSubIndex, out var moduleIdent))
+                            throw new InvalidDataException($"Could not read Modular Device Profile entry on 0x{sdoIndex:X4}:0x{sdoSubIndex:X2}");
+
+                        EcUtilities.CreateModules(slave, moduleIdent);
+                    }
+                }
+            }
         }
 
         private void ConfigureDc()
@@ -247,7 +317,7 @@ namespace EtherCAT.NET
 
             #region "PreOp"
 
-            var actualSlave = EcUtilities.ScanDevices(this.Context, _settings.InterfaceName, null);
+            var actualSlave = EcUtilities.ScanDevices(this.Context, _settings.InterfaceName, null, _logger);
 
             if (rootSlave == null)
             {
@@ -264,6 +334,7 @@ namespace EtherCAT.NET
 
             this.ValidateSlaves(slaves, actualSlaves);
             this.ConfigureSlaves(slaves);
+            this.ConfigureModules(slaves);
             this.ConfigureIoMap(slaves);
             this.ConfigureDc();
             this.ConfigureSync01(slaves);
@@ -272,13 +343,25 @@ namespace EtherCAT.NET
 
             #region "SafeOp"
 
-            EcUtilities.CheckErrorCode(this.Context, EcHL.CheckSafeOpState(this.Context), nameof(EcHL.CheckSafeOpState));
+            var safeOpState = EcHL.CheckSafeOpState(this.Context);
+
+            if (safeOpState <= 0)
+                EcUtilities.DumpALStatus(this.Context, _logger);
+
+            EcUtilities.CheckErrorCode(this.Context, safeOpState, nameof(EcHL.CheckSafeOpState));
 
             #endregion
 
             #region "Op"
 
-            EcUtilities.CheckErrorCode(this.Context, EcHL.RequestCommonState(this.Context, (UInt16)SlaveState.Operational), nameof(EcHL.RequestCommonState));
+            var operationalState = EcHL.RequestCommonState(this.Context, (UInt16)SlaveState.Operational);
+
+            if (operationalState <= 0)
+                EcUtilities.DumpALStatus(this.Context, _logger);
+
+            EcUtilities.CheckErrorCode(this.Context, operationalState, nameof(EcHL.RequestCommonState));
+
+            EcUtilities.CheckErrorCode(this.Context, EcHL.RestoreProcessDataWatchdog(this.Context), nameof(EcHL.RestoreProcessDataWatchdog));
 
             #endregion
 
@@ -307,13 +390,13 @@ namespace EtherCAT.NET
 
                     if (_lostFrameCounter == _settings.CycleFrequency)
                     {
-                        _logger.LogWarning($"frame loss occured ({ _settings.CycleFrequency } frames)");
+                        _logger.LogWarning($"frame loss occured ({_settings.CycleFrequency} frames)");
                         _lostFrameCounter = 0;
                     }
 
                     if (_wkcMismatchCounter == _settings.CycleFrequency)
                     {
-                        _logger.LogWarning($"working counter mismatch { _actualWorkingCounter }/{ _expectedWorkingCounter }");
+                        _logger.LogWarning($"working counter mismatch {_actualWorkingCounter}/{_expectedWorkingCounter}");
                         //Trace.WriteLine(EcUtilities.GetSlaveStateDescription(_ecSettings.RootSlaves.SelectMany(x => x.Descendants()).ToList()));
                         _wkcMismatchCounter = 0;
                     }
@@ -476,7 +559,7 @@ namespace EtherCAT.NET
         /// <returns>True if operation was successful, false otherwise.</returns>
         public bool ForwardEthernetToSlave(int slaveIndex, int deviceId)
         {
-            return EcHL.ForwardEthernetToSlave(this.Context, slaveIndex, deviceId);
+            return !_isReconfiguring && EcHL.ForwardEthernetToSlave(this.Context, slaveIndex, deviceId);
         }
 
         /// <summary>
@@ -488,7 +571,7 @@ namespace EtherCAT.NET
         /// <returns>True if operation was successful, false otherwise.</returns>
         public bool ForwardEthernetToTapDevice(int slaveIndex, int deviceId)
         {
-            return EcHL.ForwardEthernetToTapDevice(this.Context, slaveIndex, deviceId);
+            return !_isReconfiguring && EcHL.ForwardEthernetToTapDevice(this.Context, slaveIndex, deviceId);
         }
 
         /// <summary>
@@ -521,7 +604,7 @@ namespace EtherCAT.NET
         /// <returns>True if any data was forwarded, false otherwise.</returns>
         public bool SendSerialDataToSlave(int slaveIndex, int deviceId)
         {
-            return EcHL.SendSerialDataToSlave(slaveIndex, deviceId);
+            return !_isReconfiguring && EcHL.SendSerialDataToSlave(slaveIndex, deviceId);
         }
 
         /// <summary>
@@ -532,17 +615,18 @@ namespace EtherCAT.NET
         /// <returns>True if any data was forwarded, false otherwise.</returns>
         public bool ReadSerialDataFromSlave(int slaveIndex, int deviceId)
         {
-            return EcHL.ReadSerialDataFromSlave(slaveIndex, deviceId);
+            return !_isReconfiguring && EcHL.ReadSerialDataFromSlave(slaveIndex, deviceId);
         }
 
         /// <summary>
         /// Initialize serial handshake processing for slave device.
         /// </summary>
         /// <param name="slaveIndex">The index of the corresponding slave.</param>
+        /// <param name="multibyteCtrlStatus">True if both tx control and rx status registers are multi-byte.</param>
         /// <returns>True if initialization was successful, false otherwise.</returns>
-        public bool InitSerial(int slaveIndex)
+        public bool InitSerial(int slaveIndex, bool multibyteCtrlStatus)
         {
-            return EcHL.InitSerial(slaveIndex);
+            return EcHL.InitSerial(slaveIndex, multibyteCtrlStatus);
         }
 
         /// <summary>
@@ -573,9 +657,32 @@ namespace EtherCAT.NET
         /// <param name="slaveIndex">The index of the corresponding slave.</param>
         public void UpdateSerialIo(int slaveIndex)
         {
-            EcHL.UpdateSerialIo(this.Context, slaveIndex);
+            if (!_isReconfiguring)
+                EcHL.UpdateSerialIo(this.Context, slaveIndex);
         }
 
+        /// <summary>
+        /// Update serial handshake processing for standard slave device.
+        /// </summary>
+        /// <param name="slaveIndex">The index of the corresponding slave.</param>
+        /// <param name="input">Input process buffer.</param>
+        /// <param name="output">Output process buffer.</param>
+        public void UpdateSerialIoStandard(int slaveIndex, IntPtr input, IntPtr output)
+        {
+            if (!_isReconfiguring)
+                EcHL.UpdateSerialIoStandard(slaveIndex, input, output);
+        }
+
+        /// <summary>
+        /// Returns process data for slave device.
+        /// </summary>
+        /// <param name="slaveIndex">The index of the corresponding slave.</param>
+        /// <param name="output">Output buffer.</param>
+        /// <param name="input">Input buffer.</param>
+        public void GetProcessIo(int slaveIndex, out IntPtr output, out IntPtr input)
+        {
+            EcHL.GetProcessIo(this.Context, slaveIndex, out output, out input);
+        }
 
         /// <summary>
         /// Activate watchdog. 
@@ -623,7 +730,7 @@ namespace EtherCAT.NET
         /// <param name="fileName">Absolute path to firmware file.</param>
         /// <returns>True if operation was successful, false otherwise./returns>
         public bool DownloadFirmware(int slaveIndex, string fileName)
-        { 
+        {
             FileInfo fileInfo = new FileInfo(fileName);
             if (!fileInfo.Exists)
                 return false;
@@ -641,9 +748,9 @@ namespace EtherCAT.NET
                         int totalPackages = 0;
                         int remainingSize = -1;
 
-                        EcHL.FOECallback callback = (slaveIndex, packageNumber,  datasize) =>
+                        EcHL.FOECallback callback = (slaveIndex, packageNumber, datasize) =>
                         {
-                            if(packageNumber == 0)
+                            if (packageNumber == 0)
                                 _logger.LogInformation($"FoE: Write {datasize} bytes to {slaveIndex}. slave");
                             else
                                 _logger.LogInformation($"FoE: {packageNumber}. package with {remainingSize - datasize} bytes written to {slaveIndex}. slave. Remaining data: {datasize} bytes");
@@ -651,7 +758,7 @@ namespace EtherCAT.NET
                             if (currentPackageNumber != packageNumber)
                             {
                                 currentPackageNumber = packageNumber;
-                                if(packageNumber != 0)
+                                if (packageNumber != 0)
                                     totalPackages++;
                             }
 
@@ -675,6 +782,44 @@ namespace EtherCAT.NET
             return success;
         }
 
+        /// <summary>
+        /// Set Watchdog divider for all slaves.
+        /// </summary>
+        /// <param name="watchdogDivider">Number of 25 MHz tics (minus 2) that represent the basic watchdog increment. (Default value is 100μs = 2498).</param>
+        public bool SetWatchdogDividerAllSlaves(ushort watchdogDivider) => EcHL.SetWatchdogDividerAllSlaves(Context, watchdogDivider);
+
+        /// <summary>
+        /// Set Watchdog divider for specific slave.
+        /// </summary>
+        /// <param name="slaveIndex">The index of the corresponding slave.</param>
+        /// <param name="watchdogDivider">Number of 25 MHz tics (minus 2) that represent the basic watchdog increment. (Default value is 100μs = 2498).</param>
+        public bool SetWatchdogDivider(ushort slaveIndex, ushort watchdogDivider) => EcHL.SetWatchdogDivider(Context, slaveIndex, watchdogDivider);
+
+        /// <summary>
+        /// Set PDI Watchdog time for all slaves.
+        /// </summary>
+        /// <param name="watchdogTime">Watchdog Time PDI: number of basic watchdog increments (Default value with Watchdog divider 100μs means 100ms Watchdog).</param>
+        public bool SetPDIWatchdogAllSlaves(ushort watchdogTime) => EcHL.SetPDIWatchdogAllSlaves(Context, watchdogTime);
+
+        /// <summary>
+        /// Set PDI Watchdog time for specific slave.
+        /// </summary>
+        /// <param name="slaveIndex">The index of the corresponding slave.</param>
+        /// <param name="watchdogTime">Watchdog Time PDI: number of basic watchdog increments (Default value with Watchdog divider 100μs means 100ms Watchdog).</param>
+        public bool SetPDIWatchdog(ushort slaveIndex, ushort watchdogTime) => EcHL.SetPDIWatchdog(Context, slaveIndex, watchdogTime);
+
+        /// <summary>
+        /// Set Process Data Watchdog time for all slaves.
+        /// </summary>
+        /// <param name="watchdogTime">Watchdog Time Process Data: number of basic watchdog increments (Default value with Watchdog divider 100μs means 100ms Watchdog).</param>
+        public bool SetProcessDataWatchdogAllSlaves(ushort watchdogTime) => EcHL.SetProcessDataWatchdogAllSlaves(Context, watchdogTime);
+
+        /// <summary>
+        /// Set Process Data Watchdog time for specific slave.
+        /// </summary>
+        /// <param name="slaveIndex">The index of the corresponding slave.</param>
+        /// <param name="watchdogTime">Watchdog Time Process Data: number of basic watchdog increments (Default value with Watchdog divider 100μs means 100ms Watchdog).</param>
+        public bool SetProcessDataWatchdog(ushort slaveIndex, ushort watchdogTime) => EcHL.SetProcessDataWatchdog(Context, slaveIndex, watchdogTime);
 
         #endregion
 
@@ -692,6 +837,9 @@ namespace EtherCAT.NET
 
                         if (_statusCheckFailedCounter >= _settings.MaxRetries)
                         {
+                            _logger.LogInformation("Watchdog is starting reconfiguration lowest slave state is {State}", state);
+                            EcUtilities.DumpALStatus(this.Context, _logger);
+
                             try
                             {
                                 lock (_lock)
@@ -724,10 +872,10 @@ namespace EtherCAT.NET
                         }
 
                         _statusCheckFailedCounter = 0;
-                    }    
+                    }
                 }
                 _cts.Token.WaitHandle.WaitOne(TimeSpan.FromSeconds(_settings.WatchdogSleepTime));
-            }   
+            }
         }
 
         #region IDisposable Support
@@ -742,6 +890,12 @@ namespace EtherCAT.NET
                     Marshal.FreeHGlobal(_ioMapPtr);
 
                 _cts?.Cancel();
+
+                foreach (var handle in _callbackHandles.Values)
+                {
+                    if (handle.IsAllocated)
+                        handle.Free();
+                }
 
                 try
                 {

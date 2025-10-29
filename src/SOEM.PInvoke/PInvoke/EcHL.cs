@@ -7,13 +7,17 @@ namespace SOEM.PInvoke
     public static class EcHL
     {
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-        public delegate double PO2SOCallback(UInt16 slaveIndex);
+        public delegate int PO2SOCallback(UInt16 slaveIndex);
 
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         public delegate int FOECallback(UInt16 slave, int packetnumber, int datasize);
 
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-        public delegate void SerialRxCallback(UInt16 slave, IntPtr buffer, int datasize);
+        public delegate void SerialRxCallback(UInt16 slave, IntPtr buffer, int datasize, bool rxFifoFull);
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        public delegate void ALStatusCallback(int slave, ushort state, ushort alStatus, [MarshalAs(UnmanagedType.LPStr)] string name);
+
 
 
         #region "Helper"
@@ -45,6 +49,14 @@ namespace SOEM.PInvoke
         #endregion
 
         #region "called before OP"
+
+        /// <summary>
+        /// Disables ACK flag in order to check if slaves have reached preop state.
+        /// </summary>
+        /// <param name="ackEnabled">Flag if ack check is enabled.</param>
+        [SuppressUnmanagedCodeSecurity]
+        [DllImport(EcShared.NATIVE_DLL_NAME)]
+        public static extern int EnablePreopAckCheck(bool ackEnabled);
 
         /// <summary>
         /// Initializes EtherCAT and scans for connected slaves.
@@ -80,6 +92,17 @@ namespace SOEM.PInvoke
         [SuppressUnmanagedCodeSecurity]
         [DllImport(EcShared.NATIVE_DLL_NAME)]
         public static extern int SdoWrite(IntPtr context, UInt16 slaveIndex, UInt16 sdoIndex, byte sdoSubIndex, byte[] dataset, UInt32 datasetCount, Int32[] byteCounts);
+
+        /// <summary>
+        /// Checks if a sdo entry with index and sub index exists.
+        /// </summary>
+        /// <param name="slaveIndex">The index of the corresponding slave.</param>
+        /// <param name="sdoIndex">The index of the service data object.</param>
+        /// <param name="sdoSubindex">The sub index of the service data object.</param>
+        /// <returns>Returns true if the sdo entry for the slave exits, false otherwise.</returns>
+        [SuppressUnmanagedCodeSecurity]
+        [DllImport(EcShared.NATIVE_DLL_NAME)]
+        public static extern bool SdoEntryExists(IntPtr context, ushort slaveIndex, ushort sdoIndex, ushort sdoSubindex);
 
         /// <summary>
         /// Reads service data object data from the mailbox of the corresponding slave.
@@ -132,6 +155,11 @@ namespace SOEM.PInvoke
         [DllImport(EcShared.NATIVE_DLL_NAME)]
         public static extern int ConfigureSync01(IntPtr context, ushort slaveIndex, ref byte[] assignActivate, int assignActivateByteLength, uint cycleTime0, uint cycleTime1, int cycleShift);
 
+
+        [SuppressUnmanagedCodeSecurity]
+        [DllImport(EcShared.NATIVE_DLL_NAME)]
+        public static extern int ALStatusForEachSlave(IntPtr context, ALStatusCallback callback);
+
         /// <summary>
         /// Requests SAFE-OP state.
         /// </summary>
@@ -169,7 +197,7 @@ namespace SOEM.PInvoke
         /// <param name="length">The file length of firmware file.</param>
         /// <returns>Returns workcounter from last slave response.</returns>
         [SuppressUnmanagedCodeSecurity]
-        [DllImport(EcShared.NATIVE_DLL_NAME)] 
+        [DllImport(EcShared.NATIVE_DLL_NAME)]
         public static extern int DownloadFirmware(IntPtr context, int slaveIndex, string fileName, int length);
 
 
@@ -263,10 +291,11 @@ namespace SOEM.PInvoke
         /// Initialize serial handshake processing for slave device.
         /// </summary>
         /// <param name="slaveIndex">The index of the corresponding slave.</param>
+        /// <param name="multibyteCtrlStatus">True if both tx control and rx status registers are multi-byte.</param>
         /// <returns>True if initialization was successful, false otherwise.</returns>
         [SuppressUnmanagedCodeSecurity]
         [DllImport(EcShared.NATIVE_DLL_NAME)]
-        public static extern bool InitSerial(int slaveIndex);
+        public static extern bool InitSerial(int slaveIndex, bool multibyteCtrlStatus);
 
         /// <summary>
         /// Close serial handshake processing for slave device.
@@ -305,6 +334,26 @@ namespace SOEM.PInvoke
         public static extern void UpdateSerialIo(IntPtr context, int slaveIndex);
 
         /// <summary>
+        /// Update serial handshake processing for standard slave device.
+        /// </summary>
+        /// <param name="slaveIndex">The index of the corresponding slave.</param>
+        /// <param name="input">Input process buffer.</param>
+        /// <param name="output">Output process buffer.</param>
+        [SuppressUnmanagedCodeSecurity]
+        [DllImport(EcShared.NATIVE_DLL_NAME)]
+        public static extern void UpdateSerialIoStandard(int slaveIndex, IntPtr input, IntPtr output);
+
+        /// <summary>
+        /// Returns process data for slave device.
+        /// </summary>
+        /// <param name="slaveIndex">The index of the corresponding slave.</param>
+        /// <param name="output">Output buffer.</param>
+        /// <param name="input">Input buffer.</param>
+        [SuppressUnmanagedCodeSecurity]
+        [DllImport(EcShared.NATIVE_DLL_NAME)]
+        public static extern void GetProcessIo(IntPtr context, int slaveIndex, out IntPtr output, out IntPtr input);
+
+        /// <summary>
         /// Request specific state for all slaves.
         /// </summary>
         /// <returns>Returns 1 if operation was successful, -0x0601 otherwise.</returns>
@@ -314,11 +363,66 @@ namespace SOEM.PInvoke
 
         [SuppressUnmanagedCodeSecurity]
         [DllImport(EcShared.NATIVE_DLL_NAME)]
-        public static extern void RegisterCallback(IntPtr context, UInt16 slaveIndex, [MarshalAs(UnmanagedType.FunctionPtr)]PO2SOCallback callback);
+        public static extern void RegisterCallback(IntPtr context, UInt16 slaveIndex, IntPtr pCallBack);
+
+        /// <summary>
+        /// Set Watchdog divider for all slaves.
+        /// </summary>
+        /// <param name="watchdogDivider">Number of 25 MHz tics (minus 2) that represent the basic watchdog increment. (Default value is 100μs = 2498).</param>
+        [SuppressUnmanagedCodeSecurity]
+        [DllImport(EcShared.NATIVE_DLL_NAME)]
+        public static extern bool SetWatchdogDividerAllSlaves(IntPtr context, ushort watchdogDivider);
+
+        /// <summary>
+        /// Set Watchdog divider for specific slave.
+        /// </summary>
+        /// <param name="slaveIndex">The index of the corresponding slave.</param>
+        /// <param name="watchdogDivider">Number of 25 MHz tics (minus 2) that represent the basic watchdog increment. (Default value is 100μs = 2498).</param>
+        [SuppressUnmanagedCodeSecurity]
+        [DllImport(EcShared.NATIVE_DLL_NAME)]
+        public static extern bool SetWatchdogDivider(IntPtr context, ushort slaveIndex, ushort watchdogDivider);
+
+        /// <summary>
+        /// Set PDI Watchdog time for all slaves.
+        /// </summary>
+        /// <param name="watchdogTime">Watchdog Time PDI: number of basic watchdog increments (Default value with Watchdog divider 100μs means 100ms Watchdog).</param>
+        [SuppressUnmanagedCodeSecurity]
+        [DllImport(EcShared.NATIVE_DLL_NAME)]
+        public static extern bool SetPDIWatchdogAllSlaves(IntPtr context, ushort watchdogTime);
+
+        /// <summary>
+        /// Set PDI Watchdog time for specific slave.
+        /// </summary>
+        /// <param name="slaveIndex">The index of the corresponding slave.</param>
+        /// <param name="watchdogTime">Watchdog Time PDI: number of basic watchdog increments (Default value with Watchdog divider 100μs means 100ms Watchdog).</param>
+        [SuppressUnmanagedCodeSecurity]
+        [DllImport(EcShared.NATIVE_DLL_NAME)]
+        public static extern bool SetPDIWatchdog(IntPtr context, ushort slaveIndex, ushort watchdogTime);
+
+        /// <summary>
+        /// Set Process Data Watchdog time for all slaves.
+        /// </summary>
+        /// <param name="watchdogTime">Watchdog Time Process Data: number of basic watchdog increments (Default value with Watchdog divider 100μs means 100ms Watchdog).</param>
+        [SuppressUnmanagedCodeSecurity]
+        [DllImport(EcShared.NATIVE_DLL_NAME)]
+        public static extern bool SetProcessDataWatchdogAllSlaves(IntPtr context, ushort watchdogTime);
+
+        /// <summary>
+        /// Set Process Data Watchdog time for specific slave.
+        /// </summary>
+        /// <param name="slaveIndex">The index of the corresponding slave.</param>
+        /// <param name="watchdogTime">Watchdog Time Process Data: number of basic watchdog increments (Default value with Watchdog divider 100μs means 100ms Watchdog).</param>
+        [SuppressUnmanagedCodeSecurity]
+        [DllImport(EcShared.NATIVE_DLL_NAME)]
+        public static extern bool SetProcessDataWatchdog(IntPtr context, ushort slaveIndex, ushort watchdogTime);
 
         #endregion
 
         #region "called during OP"
+
+        [SuppressUnmanagedCodeSecurity]
+        [DllImport(EcShared.NATIVE_DLL_NAME)]
+        public static extern int RestoreProcessDataWatchdog(IntPtr context);
 
         /// <summary>
         /// Sends a frame to distribute new output process data and waits for return of this frame to receive input process data.

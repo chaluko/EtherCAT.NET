@@ -1,5 +1,5 @@
-﻿using EtherCAT.NET.Infrastructure;
-using EtherCAT.NET.Extension;
+﻿using EtherCAT.NET.Extension;
+using EtherCAT.NET.Infrastructure;
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -171,7 +171,7 @@ namespace EtherCAT.NET
                 {
                     device = currentInfo.Descriptions.Devices.Where(currentDevice =>
                     {
-                        var found = !string.IsNullOrWhiteSpace(currentDevice.Type.ProductCode) && 
+                        var found = !string.IsNullOrWhiteSpace(currentDevice.Type.ProductCode) &&
                                     !string.IsNullOrWhiteSpace(currentDevice.Type.RevisionNo) &&
                                     (int)EsiUtilities.ParseHexDecString(currentDevice.Type.ProductCode) == productCode;
 
@@ -234,6 +234,43 @@ namespace EtherCAT.NET
             return (device, group);
         }
 
+        public static EtherCATInfoDescriptionsModule FindModule(uint manufacturer, int moduleIdent)
+        {
+            uint target = unchecked((uint)moduleIdent);
+
+            static bool TryParseId(string stringIndent, out uint value)
+            {
+                value = 0;
+
+                if (string.IsNullOrWhiteSpace(stringIndent))
+                    return false;
+
+                stringIndent = stringIndent.Trim().Replace("_", "");
+
+                bool hex = stringIndent.StartsWith("#x", StringComparison.OrdinalIgnoreCase)
+                        || stringIndent.StartsWith("0x", StringComparison.OrdinalIgnoreCase)
+                        || stringIndent.EndsWith("h", StringComparison.OrdinalIgnoreCase);
+
+                if (hex)
+                {
+                    if (stringIndent.StartsWith("#x", StringComparison.OrdinalIgnoreCase) || stringIndent.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                        stringIndent = stringIndent.Substring(2);
+
+                    if (stringIndent.EndsWith("h", StringComparison.OrdinalIgnoreCase))
+                        stringIndent = stringIndent.Remove(stringIndent.Length - 1);
+
+                    return uint.TryParse(stringIndent, NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out value);
+                }
+
+                return uint.TryParse(stringIndent, NumberStyles.Integer, CultureInfo.InvariantCulture, out value);
+            }
+
+            return CacheEtherCatInfos
+                .Where(info => (uint)ParseHexDecString(info.Vendor.Id) == manufacturer)
+                .SelectMany(info => info.Descriptions?.Modules ?? Enumerable.Empty<EtherCATInfoDescriptionsModule>())
+                .FirstOrDefault(m => TryParseId(m?.Type?.ModuleIdent, out var id) && id == target);
+        }
+
         public static List<DistributedClocksOpMode> GetOpModes(this SlaveInfo slave)
         {
             return slave.Esi.Dc.OpMode
@@ -243,7 +280,9 @@ namespace EtherCAT.NET
 
         public static long ParseHexDecString(string value)
         {
-            if (value.StartsWith("#x"))
+            if (value == null)
+                return 0;
+            else if (value.StartsWith("#x"))
                 return uint.Parse(value.Replace("#x", string.Empty), NumberStyles.HexNumber);
             else
                 return long.Parse(value);

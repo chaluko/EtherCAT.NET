@@ -1,13 +1,16 @@
 ﻿using EtherCAT.NET.Extension;
 using EtherCAT.NET.Infrastructure;
+using Microsoft.Extensions.Logging;
 using SOEM.PInvoke;
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Net.NetworkInformation;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 
 namespace EtherCAT.NET
 {
@@ -68,13 +71,12 @@ namespace EtherCAT.NET
             }
         }
 
-
         public static EthercatDataType ParseEtherCatDataType(string value)
         {
             if (value == null)
                 return 0;
             else
-                return (EthercatDataType)Enum.Parse(typeof(EthercatDataType), value);
+                return EtherCatDataTypeHelper.ParseEthercatDataType(value, out _);
         }
 
         public static IEnumerable<T> TrueDistinct<T>(this IEnumerable<T> inputs)
@@ -98,6 +100,63 @@ namespace EtherCAT.NET
             return rawData.ToArray();
         }
 
+        public static string GetErrorString(IntPtr context, int errorCode, [CallerMemberName] string caller = "")
+            => BuildErrorText(context, errorCode, caller);
+
+        public static void LogErrorCode(IntPtr context, int errorCode, ILogger log, [CallerMemberName] string caller = "")
+        {
+            var text = BuildErrorText(context, errorCode, caller);
+
+            if (string.IsNullOrEmpty(text))
+                return;
+
+            using var sr = new StringReader(text);
+            string line;
+
+            while ((line = sr.ReadLine()) != null)
+            {
+                if (!string.IsNullOrWhiteSpace(line))
+                    log.LogError("{Line}", line);
+            }
+        }
+
+        /// <summary>
+        /// Checks if unmanaged status code represents an error. If true this error will be returned.
+        /// </summary>
+        /// <param name="errorCode">The error code.</param>
+        /// <param name="callerMemberName">The name of the calling function.</param>
+        /// <returns>Returns error string.</returns>
+        private static string BuildErrorText(IntPtr context, int errorCode, string caller)
+        {
+            if (errorCode > 0)
+                return string.Empty;
+
+            errorCode = -errorCode;
+
+            var messageManaged = ErrorMessage.ResourceManager.GetString($"Native_0x{errorCode:X4}");
+
+            if (string.IsNullOrWhiteSpace(messageManaged))
+                messageManaged = ErrorMessage.Native_0xFFFF;
+
+            var sb = new StringBuilder().Append(caller).Append(" failed (0x").Append(errorCode.ToString("X4")).Append("): ").Append(messageManaged);
+            var ethercatHeader = false;
+
+            while (EcHL.HasEcError(context))
+            {
+                var messageSoem = Marshal.PtrToStringAnsi(EcHL.GetNextError(context));
+
+                if (!ethercatHeader)
+                {
+                    ethercatHeader = true;
+                    sb.AppendLine().AppendLine("EtherCAT message:");
+                }
+
+                sb.Append(messageSoem);
+            }
+
+            return sb.ToString();
+        }
+
         /// <summary>
         /// Checks if unmanaged status code represents an error. If true this error will be thrown.
         /// </summary>
@@ -105,35 +164,10 @@ namespace EtherCAT.NET
         /// <param name="callerMemberName">The name of the calling function.</param>
         public static void CheckErrorCode(IntPtr context, int errorCode, [CallerMemberName()] string callerMemberName = "")
         {
-            if (errorCode <= 0)
-            {
-                errorCode = -errorCode;
+            var message_combined = GetErrorString(context, errorCode, callerMemberName);
 
-                // message_managed
-                var message_managed = ErrorMessage.ResourceManager.GetString($"Native_0x{ errorCode.ToString("X4") }");
-
-                if (string.IsNullOrWhiteSpace(message_managed))
-                    message_managed = ErrorMessage.Native_0xFFFF;
-
-                // message_SOEM
-                var message_SOEM = string.Empty;
-
-                while (EcHL.HasEcError(context))
-                {
-                    if (!string.IsNullOrWhiteSpace(message_SOEM))
-                        message_SOEM += "\n";
-
-                    message_SOEM += Marshal.PtrToStringAnsi(EcHL.GetNextError(context));
-                }
-
-                // message_combined
-                var message_combined = $"{ callerMemberName } failed (0x{ errorCode.ToString("X4") }): { message_managed }";
-
-                if (!string.IsNullOrWhiteSpace(message_SOEM))
-                    message_combined += $"\n\nEtherCAT message:\n\n{ message_SOEM }";
-
+            if (message_combined != string.Empty)
                 throw new Exception(message_combined);
-            }
         }
 
         public static Dictionary<string, string> GetAvailableNetworkInterfaces()
@@ -277,7 +311,96 @@ namespace EtherCAT.NET
             return newRootSlave;
         }
 
-        public static SlaveInfo ScanDevices(string interfaceName, SlaveInfo referenceRootSlave = null)
+        public static void CreateModules(SlaveInfo slave, int moduleIdent)
+        {
+            // We’re trying to find an entry for the module ident number in the ESI cache. An cache entry may not exist because, for
+            // example, K - Bus terminals are not shipped with an ESI file, but they are mapped in the Modular Device Profile (MDP).
+
+            var module = EsiUtilities.FindModule(slave.Manufacturer, moduleIdent);
+
+            if (module == null)
+                return;
+
+            var pdos = new List<SlavePdo>();
+            var base64ImageData = ""u8.ToArray();
+
+            foreach (DataDirection dataDirection in Enum.GetValues(typeof(DataDirection)))
+            {
+                IEnumerable<PdoType> pdoTypes = null;
+
+                switch (dataDirection)
+                {
+                    case DataDirection.Output:
+                        pdoTypes = module.RxPdo;
+                        break;
+                    case DataDirection.Input:
+                        pdoTypes = module.TxPdo;
+                        break;
+                }
+
+                if (pdoTypes == null)
+                    continue;
+
+                foreach (var pdoType in pdoTypes)
+                {
+                    var osMax = Convert.ToUInt16(pdoType.OSMax);
+
+                    if (osMax == 0)
+                    {
+                        var pdoName = pdoType.Name.First().Value;
+                        var pdoIndex = (ushort)EsiUtilities.ParseHexDecString(pdoType.Index.Value);
+                        var syncManager = pdoType.SmSpecified ? pdoType.Sm : -1;
+
+                        var slavePdo = new SlavePdo(slave, pdoName, pdoIndex, osMax, pdoType.Fixed, pdoType.Mandatory, syncManager);
+
+                        pdos.Add(slavePdo);
+
+                        var slaveVariables = pdoType.Entry.Select(x =>
+                        {
+                            var variableIndex = (ushort)EsiUtilities.ParseHexDecString(x.Index.Value);
+                            var subIndex = x.SubIndex == null ? (byte)0 : (byte)EsiUtilities.ParseHexDecString(x.SubIndex);
+                            //// Improve. What about -1 if SubIndex does not exist?
+                            return new SlaveVariable(slavePdo, x.Name?.FirstOrDefault()?.Value, variableIndex, subIndex, dataDirection, EcUtilities.ParseEtherCatDataType(x.DataType?.Value), (byte)x.BitLen);
+                        }).ToList();
+
+                        slavePdo.SetVariables(slaveVariables);
+                    }
+                    else
+                    {
+                        for (ushort indexOffset = 0; indexOffset <= osMax - 1; indexOffset++)
+                        {
+                            var pdoName = $"{pdoType.Name.First().Value} [{indexOffset}]";
+                            var pdoIndex = (ushort)((ushort)EsiUtilities.ParseHexDecString(pdoType.Index.Value) + indexOffset);
+                            var syncManager = pdoType.SmSpecified ? pdoType.Sm : -1;
+                            var indexOffset_Tmp = indexOffset;
+
+                            var slavePdo = new SlavePdo(slave, pdoName, pdoIndex, osMax, pdoType.Fixed, pdoType.Mandatory, syncManager);
+
+                            pdos.Add(slavePdo);
+
+                            var slaveVariables = pdoType.Entry.Select(x =>
+                            {
+                                var variableIndex = (ushort)EsiUtilities.ParseHexDecString(x.Index.Value);
+                                var subIndex = (byte)(byte.Parse(x.SubIndex) + indexOffset_Tmp);
+                                //// Improve. What about -1 if SubIndex does not exist?
+                                return new SlaveVariable(slavePdo, x.Name.FirstOrDefault()?.Value, variableIndex, subIndex, dataDirection, EcUtilities.ParseEtherCatDataType(x.DataType?.Value), (byte)x.BitLen);
+                            }).ToList();
+
+                            slavePdo.SetVariables(slaveVariables);
+                        }
+                    }
+                }
+            }
+
+            // image data
+            if (module.ItemElementName == ItemChoiceType6.ImageData16x14)
+                base64ImageData = (byte[])module.Item;
+
+            // attach dynamic data
+            slave.Modules.Add(new SlaveInfoDynamicData(module.Name.First().Value, module.Type.ModuleClass, pdos, base64ImageData));
+        }
+
+        public static SlaveInfo ScanDevices(string interfaceName, SlaveInfo referenceRootSlave = null, ILogger logger = null)
         {
             var nic = NetworkInterface.GetAllNetworkInterfaces().Where(x => x.Name == interfaceName).FirstOrDefault();
 
@@ -288,10 +411,19 @@ namespace EtherCAT.NET
                 throw new Exception($"The network interface '{interfaceName}' is not linked. Aborting action.");
 
             var context = EcHL.CreateContext();
-            var rootSlave = EcUtilities.ScanDevices(context, interfaceName, referenceRootSlave);
+            var rootSlave = EcUtilities.ScanDevices(context, interfaceName, referenceRootSlave, logger);
             EcHL.FreeContext(context);
 
             return rootSlave;
+        }
+
+        /// <summary>
+        /// Disables ACK flag in order to check if slaves have reached preop state.
+        /// </summary>
+        /// <param name="ackEnabled">Flag if ack check is enabled.</param>
+        public static void EnablePreopAckCheck(bool ackEnabled)
+        {
+            EcHL.EnablePreopAckCheck(ackEnabled);
         }
 
         /// <summary>
@@ -299,7 +431,7 @@ namespace EtherCAT.NET
         /// </summary>
         /// <param name="interfaceName">The name of the network adapter.</param>
         /// <returns>Returns found slave.</returns>
-        public static SlaveInfo ScanDevices(IntPtr context, string interfaceName, SlaveInfo referenceSlave = null)
+        public static SlaveInfo ScanDevices(IntPtr context, string interfaceName, SlaveInfo referenceSlave = null, ILogger logger = null)
         {
             ec_slave_info_t[] refSlaveIdentifications = null;
 
@@ -315,7 +447,7 @@ namespace EtherCAT.NET
                 .FirstOrDefault();
 
             if (networkInterface == null)
-                throw new Exception($"{ ErrorMessage.SoemWrapper_NetworkInterfaceNotFound } Interface name: '{ interfaceName }'.");
+                throw new Exception($"{ErrorMessage.SoemWrapper_NetworkInterfaceNotFound} Interface name: '{interfaceName}'.");
 
             if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
                 interfaceName = $@"rpcap://\Device\NPF_{networkInterface.Id}";
@@ -327,7 +459,15 @@ namespace EtherCAT.NET
             else
                 throw new PlatformNotSupportedException();
 
-            EcUtilities.CheckErrorCode(context, EcHL.ScanDevices(context, interfaceName, out var slaveIdentifications, out var slaveCount));
+            var errorString = EcUtilities.GetErrorString(context, EcHL.ScanDevices(context, interfaceName, out var slaveIdentifications, out var slaveCount));
+
+            if (errorString != string.Empty)
+            {
+                if (logger != null)
+                    DumpALStatus(context, logger);
+
+                throw new Exception(errorString);
+            }
 
             // create slaveInfo from received data
             var offset = 0;
@@ -346,6 +486,14 @@ namespace EtherCAT.NET
             }
 
             return EcUtilities.ToSlaveInfo(newSlaveIdentifications);
+        }
+
+        public static void DumpALStatus(IntPtr ctx, ILogger logger)
+        {
+            void cb(int slave, ushort state, ushort al, string name) =>
+                 logger.LogInformation("Slave {Slave} ({Name}): state=0x{State:X2} AL=0x{AL:X4}", slave, name, state, al);
+
+            EcHL.ALStatusForEachSlave(ctx, cb);
         }
 
         public static SlavePdo[] UploadPdoConfig(IntPtr context, UInt16 slave, UInt16 smIndex)
@@ -565,8 +713,8 @@ namespace EtherCAT.NET
                     }
                     else
                     {
-                        string hasCompleteAccess = slave.Esi.Mailbox?.CoE?.CompleteAccess == true 
-                            ? " True" 
+                        string hasCompleteAccess = slave.Esi.Mailbox?.CoE?.CompleteAccess == true
+                            ? " True"
                             : "False";
 
                         slaveStateDescription.AppendLine($"Slave {slaveIndex,3} | CA: {hasCompleteAccess} | Req-State: 0x{requestedState:X4} | Act-State: 0x{actualState:X4} | AL-Status: 0x{alStatusCode:X4} | Sys-Time Diff: 0x{systemTimeDifference:X8} | Speed Counter Diff: 0x{speedCounterDifference:X4} | #Pdo out: {outputPdoCount} | #Pdo in: {inputPdoCount} | ({slave.DynamicData.Name})");
@@ -599,7 +747,57 @@ namespace EtherCAT.NET
                 sdoSubIndex,
                 dataset
             );
-        }       
+        }
+
+        /// <summary>
+        /// Reads an SDO value (index/subindex) with retry logic into <typeparamref name="T"/>.
+        /// </summary>
+        /// <typeparam name="T">
+        /// Struct/value type that can be marshaled from bytes <see cref="StructLayoutAttribute"/>).
+        /// </typeparam>
+        /// <param name="context">context</param>
+        /// <param name="slaveIndex">Slave index</param>
+        /// <param name="sdoIndex">COE/SDO index</param>
+        /// <param name="sdoSubIndex">Subindex</param>
+        /// <param name="value">Output value</param>
+        /// <param name="maxRetries">Number of additional attempts after a failure</param>
+        /// <param name="retryDelay">Delay in milliseconds between retries</param>
+        /// <returns>
+        /// <c>true</c> if the read succeeded (WorkCounter == 1); otherwise <c>false</c>.
+        /// </returns>
+        /// <remarks>
+        /// - Resets the requested buffer size (<c>psize</c>) before each read.
+        /// - Pins the buffer for the duration of the read attempts.
+        /// - On failure, waits and retries until the retry limit is reached.
+        /// </remarks>
+        public static bool TryReadSdoValue<T>(IntPtr context, ushort slaveIndex, ushort sdoIndex, byte sdoSubIndex, out T value, int maxRetries = 3, int retryDelay = 10)
+            where T : unmanaged
+        {
+            int size = Unsafe.SizeOf<T>();
+            byte[] buffer = new byte[size];
+            var handle = GCHandle.Alloc(buffer, GCHandleType.Pinned);
+            var dataPtr = handle.AddrOfPinnedObject();
+
+            const int Timeout = 200000;
+            var psize = size;
+            var retriesCopy = maxRetries;
+            int workCounter;
+
+            do
+            {
+                psize = size;
+                workCounter = EcCoE.ecx_SDOread(context, slaveIndex, sdoIndex, sdoSubIndex, false, ref psize, dataPtr, Timeout);
+
+                if (maxRetries < retriesCopy)
+                    Thread.Sleep(retryDelay);
+
+            } while (workCounter != 1 && --maxRetries >= 0);
+
+            value = Marshal.PtrToStructure<T>(dataPtr);
+            handle.Free();
+
+            return workCounter == 1;
+        }
 
         #endregion
     }

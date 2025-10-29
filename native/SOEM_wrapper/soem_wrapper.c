@@ -1,4 +1,4 @@
-/* 
+﻿/*
  *	Timeout occurs often. Effects are:
  *
  *	- wkc = 0 BUT ecx_SDOread succeeds (!) (see ecx_readPDOassign) -> Slaves do no start and throw ADS error 0x1D or 0x1E because sync manager length is not correctly calculated.
@@ -8,8 +8,8 @@
  *		- Increase thread priority
  *		- ...
  *
- *	- SdoWrite takes too long (e.g. EL6601). 
- *		-> Solution: increase timeout SdoWrite() 
+ *	- SdoWrite takes too long (e.g. EL6601).
+ *		-> Solution: increase timeout SdoWrite()
  *
  */
 
@@ -59,7 +59,21 @@ uint8 rx_buffer_term[1500];
 
 char tmp_char[255];
 
+bool check_ack_preop = true;
 
+// watchdog register
+#define WATCHDOG_DIVIDER            0x0400
+#define WATCHDOG_TIME_PDI           0x0410
+#define WATCHDOG_TIME_PROCESS_DATA  0x0420
+
+
+// backup for process data watchdog
+typedef struct {
+    uint16_t value;   // saved value
+    uint8_t  saved;   // 1 = value was saved, 0 = no saved value
+} PdWdBackup;
+
+static PdWdBackup pdwd_backup[EC_MAXSLAVE + 1];
 
 
 uint16 CalculateCrc(byte* data)
@@ -369,7 +383,7 @@ int CALLCONV GetSyncManagerType(ecx_contextt* context, uint16 slaveIndex, uint16
 }
 
 /*
- *  Clear FMMU and SM registers of slave in order to 
+ *  Clear FMMU and SM registers of slave in order to
  *  program bootstrap configuration
  *
  *  context: Current context pointer
@@ -381,21 +395,21 @@ static void clear_FMMU_and_SM_registers(ecx_contextt* context, int slave)
     memset(fmmu_zero, 0, sizeof(fmmu_zero));
 
     /* clean FMMU registers */
-    ecx_FPWR(context->port, context->slavelist[slave].configadr, ECT_REG_FMMU0, 
+    ecx_FPWR(context->port, context->slavelist[slave].configadr, ECT_REG_FMMU0,
         sizeof(fmmu_zero), fmmu_zero, EC_TIMEOUTRET3);
-    ecx_FPWR(context->port, context->slavelist[slave].configadr, ECT_REG_FMMU1, 
+    ecx_FPWR(context->port, context->slavelist[slave].configadr, ECT_REG_FMMU1,
         sizeof(fmmu_zero), fmmu_zero, EC_TIMEOUTRET3);
 
     /* clean SM0 and SM1 registers to set new bootstrap values later */
-    ecx_FPWR(context->port, context->slavelist[slave].configadr, ECT_REG_SM0, 
+    ecx_FPWR(context->port, context->slavelist[slave].configadr, ECT_REG_SM0,
         sizeof(ec_smt), sm_zero, EC_TIMEOUTRET3);
-    ecx_FPWR(context->port, context->slavelist[slave].configadr, ECT_REG_SM1, 
+    ecx_FPWR(context->port, context->slavelist[slave].configadr, ECT_REG_SM1,
         sizeof(ec_smt), sm_zero, EC_TIMEOUTRET3);
 }
 
 /*
  *  Set boot mailbox configuration master --> slave
- * 
+ *
  *  slave: Pointer to ec_slavet
  *  startAddress: SM start address
  *  length: SM length
@@ -412,7 +426,7 @@ static void set_rx_boot_mailbox(ec_slavet* slave, uint16 startAddress, uint16 le
 
 /*
  *  Set boot mailbox configuration slave --> master
- * 
+ *
  *  slave: Pointer to ec_slavet
  *  startAddress: SM start address
  *  length: SM length
@@ -437,19 +451,19 @@ static void set_bootstrap(ecx_contextt* context, int slave)
 {
     memset(FMMU, 0, sizeof(ec_fmmut) * 2);
     /* read content of current FMMU registers */
-    ecx_FPRD(context->port, context->slavelist[slave].configadr, ECT_REG_FMMU0, 
+    ecx_FPRD(context->port, context->slavelist[slave].configadr, ECT_REG_FMMU0,
         sizeof(ec_fmmut), &FMMU[0], EC_TIMEOUTRET3);
-    ecx_FPRD(context->port, context->slavelist[slave].configadr, ECT_REG_FMMU1, 
+    ecx_FPRD(context->port, context->slavelist[slave].configadr, ECT_REG_FMMU1,
         sizeof(ec_fmmut), &FMMU[1], EC_TIMEOUTRET3);
 
     memset(SM, 0, sizeof(ec_smt) * 2);
     /* read content of current SM registers */
-    ecx_FPRD(context->port, context->slavelist[slave].configadr, ECT_REG_SM0, 
+    ecx_FPRD(context->port, context->slavelist[slave].configadr, ECT_REG_SM0,
         sizeof(ec_smt), &SM[0], EC_TIMEOUTRET3);
-    ecx_FPRD(context->port, context->slavelist[slave].configadr, ECT_REG_SM1, 
+    ecx_FPRD(context->port, context->slavelist[slave].configadr, ECT_REG_SM1,
 	    sizeof(ec_smt), &SM[1], EC_TIMEOUTRET3);
 
-    clear_FMMU_and_SM_registers(context, slave);	
+    clear_FMMU_and_SM_registers(context, slave);
 
     /* read BOOT mailbox data, master -> slave */
     uint32 data = ecx_readeeprom(context, slave, ECT_SII_BOOTRXMBX, EC_TIMEOUTEEP);
@@ -460,10 +474,10 @@ static void set_bootstrap(ecx_contextt* context, int slave)
     set_tx_boot_mailbox(&context->slavelist[slave], (uint16)LO_WORD(data), (uint16)HI_WORD(data));
 
     /* program SM0 mailbox in for slave */
-    ecx_FPWR (context->port, context->slavelist[slave].configadr, ECT_REG_SM0, 
+    ecx_FPWR (context->port, context->slavelist[slave].configadr, ECT_REG_SM0,
         sizeof(ec_smt), &context->slavelist[slave].SM[0], EC_TIMEOUTRET);
     /* program SM1 mailbox out for slave */
-    ecx_FPWR (context->port, context->slavelist[slave].configadr, ECT_REG_SM1, 
+    ecx_FPWR (context->port, context->slavelist[slave].configadr, ECT_REG_SM1,
         sizeof(ec_smt), &context->slavelist[slave].SM[1], EC_TIMEOUTRET);
 }
 
@@ -483,10 +497,10 @@ static void revert_bootstrap(ecx_contextt* context, int slave)
     set_tx_boot_mailbox(&context->slavelist[slave], SM[1].StartAddr, SM[1].SMlength);
 
     /* restore SM0 mailbox in for slave */
-    ecx_FPWR (context->port, context->slavelist[slave].configadr, ECT_REG_SM0, 
+    ecx_FPWR (context->port, context->slavelist[slave].configadr, ECT_REG_SM0,
         sizeof(ec_smt), &context->slavelist[slave].SM[0], EC_TIMEOUTRET);
     /* restore SM1 mailbox out for slave */
-    ecx_FPWR (context->port, context->slavelist[slave].configadr, ECT_REG_SM1, 
+    ecx_FPWR (context->port, context->slavelist[slave].configadr, ECT_REG_SM1,
         sizeof(ec_smt), &context->slavelist[slave].SM[1], EC_TIMEOUTRET);
 
     /* copy stored FMMU registers */
@@ -494,10 +508,10 @@ static void revert_bootstrap(ecx_contextt* context, int slave)
     memcpy(&context->slavelist[slave].FMMU[1], &FMMU[1], sizeof(ec_fmmut));
 
     /* restore FMMU0 */
-    ecx_FPWR (context->port, context->slavelist[slave].configadr, ECT_REG_FMMU0, 
+    ecx_FPWR (context->port, context->slavelist[slave].configadr, ECT_REG_FMMU0,
         sizeof(ec_fmmut), &context->slavelist[slave].FMMU[0], EC_TIMEOUTRET);
     /* restore FMMU0 */
-    ecx_FPWR (context->port, context->slavelist[slave].configadr, ECT_REG_FMMU1, 
+    ecx_FPWR (context->port, context->slavelist[slave].configadr, ECT_REG_FMMU1,
         sizeof(ec_fmmut), &context->slavelist[slave].FMMU[1], EC_TIMEOUTRET);
 }
 
@@ -543,9 +557,9 @@ uint16 CALLCONV RequestState(ecx_contextt* context, int slave, uint16 state)
         set_bootstrap(context, slave);
     }
 
-    /* if current state is EC_STATE_BOOT and requested state is EC_STATE_INIT 
+    /* if current state is EC_STATE_BOOT and requested state is EC_STATE_INIT
         we have to restore FMMU and SM registers */
-    if((context->slavelist[slave].state == EC_STATE_BOOT) && 
+    if((context->slavelist[slave].state == EC_STATE_BOOT) &&
         (state == EC_STATE_INIT))
     {
         revert_bootstrap(context, slave);
@@ -553,7 +567,7 @@ uint16 CALLCONV RequestState(ecx_contextt* context, int slave, uint16 state)
 
     context->slavelist[slave].state = state;
     ecx_writestate(context, slave);
-	
+
     uint16 slaveState = EC_STATE_NONE;
     int counter = 10;
 
@@ -585,7 +599,7 @@ uint16 CALLCONV GetState(ecx_contextt* context, int slave)
  *
  *  context: Current context pointer
  *  slave: Slave number
- *  fileName: File name 
+ *  fileName: File name
  *  length: File length
  *
  *  returns: Workcounter from last slave response
@@ -617,7 +631,7 @@ int CALLCONV DownloadFirmware(ecx_contextt* context, int slave, char *fileName, 
  */
 void CALLCONV RegisterFOECallback(ecx_contextt* context, int CALLCONV callback(uint16 slave, int packetnumber, int datasize))
 {
-    context->FOEhook = (int (*)(uint16 slave, int packetnumber, int datasize))callback;	
+    context->FOEhook = (int (*)(uint16 slave, int packetnumber, int datasize))callback;
 }
 
 /*
@@ -626,8 +640,8 @@ void CALLCONV RegisterFOECallback(ecx_contextt* context, int CALLCONV callback(u
  *  interfaceName: Virtual network interface name.
  *  deviceId [out]: Virtual network device Id != -1 if successful.
  *
- *  returns: Actually virtual network device name set by kernel. 
- * 
+ *  returns: Actually virtual network device name set by kernel.
+ *
  */
 char* CALLCONV CreateVirtualNetworkDevice(char *interfaceName, int* deviceId)
 {
@@ -666,7 +680,7 @@ bool CALLCONV ForwardEthernetToSlave(ecx_contextt* context, int slave, int devic
     {
         ec_etherheadert *bp = (ec_etherheadert *)tx_buffer_net;
         uint16 type = (bp->etype << 8 | bp->etype >> 8);
-       
+
         if (type != ETH_P_ECAT)
         {
             wk = ecx_EOEsend(context, slave, 0, size, (void*)tx_buffer_net, 0);
@@ -677,7 +691,7 @@ bool CALLCONV ForwardEthernetToSlave(ecx_contextt* context, int slave, int devic
 }
 
 /*
- *  Read ethernet data from slave via EoE and forward it to the 
+ *  Read ethernet data from slave via EoE and forward it to the
  *  virtual network device.
  *
  *  context: Current context pointer.
@@ -694,7 +708,7 @@ bool CALLCONV ForwardEthernetToTapDevice(ecx_contextt* context, int slave, int d
 
     if (wk > 0)
     {
-        ec_etherheadert *bp = (ec_etherheadert *)rx_buffer_net;        
+        ec_etherheadert *bp = (ec_etherheadert *)rx_buffer_net;
         uint16 type = (bp->etype << 8 | bp->etype >> 8);
 
         if(type != ETH_P_ECAT)
@@ -717,7 +731,7 @@ char* CreateVirtualSerialPort(int* deviceId)
 {
     memset(tmp_char, 0, sizeof(tmp_char));
     *deviceId = create_virtual_serial_port(tmp_char);
-    
+
     return (char*) tmp_char;
 }
 
@@ -769,7 +783,7 @@ bool CALLCONV ReadSerialDataFromSlave(int slave, int deviceId)
 
     if(data_received)
     {
-        size = write_virtual_serial_port(rx_buffer_term, size_of_rx, deviceId);   
+        size = write_virtual_serial_port(rx_buffer_term, size_of_rx, deviceId);
     }
 
     return (size > 0) && data_received ? true : false;
@@ -779,19 +793,20 @@ bool CALLCONV ReadSerialDataFromSlave(int slave, int deviceId)
  *  Initialize serial handshake processing for slave device.
  *
  *  slave: Slave number.
- * 
+ *  multibyte_ctrl_status: True if both tx control and rx status registers are multi-byte.
+ *
  * returns: True if initialization was successful, false otherwise.
  */
-bool CALLCONV InitSerial(int slave)
+bool CALLCONV InitSerial(int slave, bool multibyte_ctrl_status)
 {
-    return init_serial(slave);
+    return init_serial(slave, multibyte_ctrl_status);
 }
 
 /*
  *  Close serial handshake processing for slave device.
  *
  *  slave: Slave number.
- * 
+ *
  * returns: True if close was successful, false otherwise.
  */
 bool CALLCONV CloseSerial(int slave)
@@ -804,11 +819,11 @@ bool CALLCONV CloseSerial(int slave)
  *
  *  slave: Slave number.
  *  callback: Callback.
- * 
+ *
  */
-void CALLCONV RegisterSerialRxCallback(uint16 slave, void CALLCONV callback(uint16 slave, uint8_t* buffer, int datasize))
+void CALLCONV RegisterSerialRxCallback(uint16 slave, rx_callback_t callback)
 {
-    register_rx_callback(slave, (void (*)(uint16_t slave, uint8_t* buffer, int datasize))callback);
+    register_rx_callback(slave, callback);
 }
 
 /*
@@ -817,7 +832,7 @@ void CALLCONV RegisterSerialRxCallback(uint16 slave, void CALLCONV callback(uint
  *  slave: Slave number.
  *  tx_buffer: Tx buffer
  *  datasize: Size of tx buffer.
- * 
+ *
  * returns: True if buffer was set successfully, false otherwise.
  */
 bool CALLCONV SetTxBuffer(uint16 slave, uint8* tx_buffer, int datasize)
@@ -830,12 +845,42 @@ bool CALLCONV SetTxBuffer(uint16 slave, uint8* tx_buffer, int datasize)
  *
  *  context: Current context pointer.
  *  slave: Slave number.
- * 
+ *
  * returns: True if close was successful, false otherwise.
  */
 void CALLCONV UpdateSerialIo(ecx_contextt* context, int slave)
 {
     update_serial(slave, context->slavelist[slave].outputs, context->slavelist[slave].inputs);
+}
+
+/*
+ * Update serial handshake processing for standard slave device.
+ *
+ * context: Current context pointer.
+ * slave : Slave number.
+ * tx_data: Input process buffer.
+ * rx_data: Output process buffer.
+ *
+ * returns : True if close was successful, false otherwise.
+*/
+void CALLCONV UpdateSerialIoStandard(int slave, uint8_t* tx_data, uint8_t* rx_data)
+{
+    update_serial(slave, tx_data, rx_data);
+}
+
+/*
+ *  Get process buffers of specific slave device.
+ *
+ *  context: Current context pointer.
+ *  slave: Slave number.
+ *  output: Output buffer.
+ *  input: Input buffer.
+ *
+ */
+void CALLCONV GetProcessIo(ecx_contextt* context, int slave, char** output, char** input)
+{
+    *output = context->slavelist[slave].outputs;
+    *input = context->slavelist[slave].inputs;
 }
 
 /*
@@ -871,8 +916,94 @@ int CALLCONV RequestCommonState(ecx_contextt* context, uint16 state)
 
         ecx_statecheck(context, 0, state, 5 * EC_TIMEOUTSTATE);
     } while (counter-- && (context->slavelist[0].state != state));
-    
+
     return context->slavelist[0].state == state ? 1 : -0x0601;
+}
+
+void CALLCONV ALStatusForEachSlave(ecx_contextt* context, void CALLCONV callback(int slave, uint16_t state, uint16_t al, const char* name))
+{
+    if (context == NULL || context->slavecount == NULL || callback == NULL) return;
+
+    (void)ecx_readstate(context);
+    int n = *context->slavecount;
+
+    for (int i = 1; i <= n; ++i)
+    {
+        callback(i, context->slavelist[i].state,
+            context->slavelist[i].ALstatuscode,
+            context->slavelist[i].name);
+    }
+}
+
+static bool sdo_entry_exists(ecx_contextt* context, uint16 slaveIndex, uint16 sdoIndex, uint8 sdoSubIndex)
+{
+    uint8 buf[256];
+    memset(buf, 0, sizeof(buf));
+    int size = sizeof(buf);
+
+    int rc = ecx_SDOread(context, slaveIndex, sdoIndex, sdoSubIndex, FALSE, &size, buf, EC_TIMEOUTRXM);
+
+    if (rc == 1)
+        return true;
+
+    bool sawRelevantError = false;
+    bool exists = false;
+    ec_errort err;
+
+    while (ecx_iserror(context))
+    {
+        memset(&err, 0, sizeof(err));
+        ecx_poperror(context, &err);
+
+        if (err.Etype != EC_ERR_TYPE_SDO_ERROR) continue;
+        if (err.Slave != slaveIndex)            continue;
+        if (err.Index != sdoIndex)              continue;
+
+        sawRelevantError = true;
+
+        //  index does not exist           sub index does not exist
+        if (err.AbortCode == 0x06020000 || err.AbortCode == 0x06090011)
+			break;
+
+        exists = true;
+        break;
+    }
+
+    if (sawRelevantError)
+        return exists;
+
+    return false;
+}
+
+bool CALLCONV SdoEntryExists(ecx_contextt* context, uint16 slaveIndex, uint16 sdoIndex, uint8 sdoSubIndex)
+{
+    ec_ODlistt odList;
+    memset(&odList, 0, sizeof(odList));
+
+    if (ecx_readODlist(context, slaveIndex, &odList) == 0 || odList.Entries == 0)
+        return sdo_entry_exists(context, slaveIndex, sdoIndex, sdoSubIndex);
+
+    int item = -1;
+
+    for (int i = 0; i < odList.Entries; ++i)
+    {
+        if (odList.Index[i] == sdoIndex)
+        {
+            item = i;
+            break;
+        }
+    }
+
+    if (item < 0)
+        return sdo_entry_exists(context, slaveIndex, sdoIndex, sdoSubIndex);
+
+    if (sdoSubIndex == 0x00)
+        return true;
+
+    if (ecx_readODdescription(context, (uint16)item, &odList) == 0)
+        return sdo_entry_exists(context, slaveIndex, sdoIndex, sdoSubIndex);
+
+    return (sdoSubIndex <= odList.MaxSub[item]);
 }
 
 int CALLCONV CheckSafeOpState(ecx_contextt* context)
@@ -962,7 +1093,7 @@ int CALLCONV ConfigureDc(ecx_contextt* context, uint32 frameCount, uint32 target
     }
 }
 
-int CALLCONV ConfigureIoMap(ecx_contextt* context, char* ioMap, int* slaveRxPdoOffsetSet, int* slaveTxPdoOffsetSet, int* expectedWorkingCounter)
+int CALLCONV ConfigureIoMap(ecx_contextt* context, uint8* ioMap, int* slaveRxPdoOffsetSet, int* slaveTxPdoOffsetSet, int* expectedWorkingCounter)
 {
     int ioMapSize;
 
@@ -976,12 +1107,12 @@ int CALLCONV ConfigureIoMap(ecx_contextt* context, char* ioMap, int* slaveRxPdoO
     for (int slave = 1; slave < *context->slavecount + 1; slave++)
     {
         if (context->slavelist[slave].outputs != NULL)
-            slaveRxPdoOffsetSet[slave] = (int)(context->slavelist[slave].outputs - (uint8*)ioMap);
+            slaveRxPdoOffsetSet[slave] = (int)(context->slavelist[slave].outputs - ioMap);
         else
             slaveRxPdoOffsetSet[slave] = -1;
 
         if (context->slavelist[slave].inputs != NULL)
-            slaveTxPdoOffsetSet[slave] = (int)(context->slavelist[slave].inputs - (uint8*)ioMap);
+            slaveTxPdoOffsetSet[slave] = (int)(context->slavelist[slave].inputs - ioMap);
         else
             slaveTxPdoOffsetSet[slave] = -1;
     }
@@ -1014,7 +1145,7 @@ int CALLCONV SdoWrite(ecx_contextt* context, uint16 slaveIndex, uint16 sdoIndex,
         if (sdoSubIndex == 0)
         {
             uint8* datasetPadded = calloc(totalByteCount + 1, 1);
-            
+
             datasetPadded[0] = dataset[0];
 
             for (int i = 1; i < totalByteCount; i++)
@@ -1066,9 +1197,157 @@ int CALLCONV SdoWrite(ecx_contextt* context, uint16 slaveIndex, uint16 sdoIndex,
     }
 }
 
+void CALLCONV EnablePreopAckCheck(bool ack_enabled)
+{
+    check_ack_preop = ack_enabled;
+}
+
+static bool write_watchdog_register(ecx_contextt* context, uint16_t slaveIndex, uint16_t wd_register, uint16_t value)
+{
+    return ecx_FPWR(context->port, context->slavelist[slaveIndex].configadr, wd_register, sizeof(value), &value, EC_TIMEOUTRET) == 1;
+}
+
+static bool write_watchdog_register_all_slaves(ecx_contextt* context, uint16_t wd_register, uint16_t value)
+{
+	bool success = true;
+
+    for (uint16_t slaveIndex = 1; slaveIndex < *context->slavecount + 1; slaveIndex++)
+    {
+        if (!write_watchdog_register(context, slaveIndex, wd_register, value))
+        {
+            success = false;
+			break;
+        }
+    }
+
+    return success;
+}
+
+/*
+ *  Set Watchdog divider for all slaves
+ *
+ *  context: Current context pointer
+ *  watchdogDivder: Number of 25 MHz tics (minus 2) that represent the
+ *  basic watchdog increment. (Default value is 100μs = 2498)
+ *
+ *  returns: True if successfull false otherwise
+ */
+bool CALLCONV SetWatchdogDividerAllSlaves(ecx_contextt * context, uint16_t watchdogDivider)
+{
+    return write_watchdog_register_all_slaves(context, WATCHDOG_DIVIDER, watchdogDivider);
+}
+
+/*
+ *  Set Watchdog divider for specific slave
+ *
+ *  context: Current context pointer
+ *  slaveIndex: Index of the slave
+ *  watchdogDivder: Number of 25 MHz tics (minus 2) that represent the
+ *  basic watchdog increment. (Default value is 100μs = 2498)
+ *
+ *  returns: True if successfull false otherwise
+ */
+bool CALLCONV SetWatchdogDivider(ecx_contextt * context, int slaveIndex, uint16_t watchdogDivider)
+{
+    return write_watchdog_register(context, slaveIndex, WATCHDOG_DIVIDER, watchdogDivider);
+}
+
+/*
+ *  Set PDI Watchdog time for all slaves
+ *
+ *  context: Current context pointer
+ *  watchdogTime: Watchdog Time PDI: number of basic watchdog increments
+ *  (Default value with Watchdog divider 100μs means 100ms Watchdog)
+ *
+ *  returns: True if successfull false otherwise
+ */
+bool CALLCONV SetPDIWatchdogAllSlaves(ecx_contextt * context, uint16_t watchdogTime)
+{
+    return write_watchdog_register_all_slaves(context, WATCHDOG_TIME_PDI, watchdogTime);
+}
+
+/*
+ *  Set PDI Watchdog time for specific slave
+ *
+ *  context: Current context pointer
+ *  slaveIndex: Index of the slave
+ *  watchdogTime: Watchdog Time PDI: number of basic watchdog increments
+ *  (Default value with Watchdog divider 100μs means 100ms Watchdog)
+ *
+ *  returns: True if successfull false otherwise
+ */
+bool CALLCONV SetPDIWatchdog(ecx_contextt * context, int slaveIndex, uint16_t watchdogTime)
+{
+    return write_watchdog_register(context, slaveIndex, WATCHDOG_TIME_PDI, watchdogTime);
+}
+
+/*
+ *  Set Process Data Watchdog time for all slaves
+ *
+ *  context: Current context pointer
+ *  watchdogTime: Watchdog Time Process Data: number of basic watchdog increments
+ * (Default value with Watchdog divider 100μs means 100ms Watchdog)
+ *
+ *  returns: True if successfull false otherwise
+ */
+bool CALLCONV SetProcessDataWatchdogAllSlaves(ecx_contextt * context, uint16_t watchdogTime)
+{
+    return write_watchdog_register_all_slaves(context, WATCHDOG_TIME_PROCESS_DATA, watchdogTime);
+}
+
+/*
+ *  Set Process Data Watchdog time for specific slave
+ *
+ *  context: Current context pointer
+ *  slaveIndex: Index of the slave
+ *  watchdogTime: Watchdog Time Process Data: number of basic watchdog increments
+ * (Default value with Watchdog divider 100μs means 100ms Watchdog)
+ *
+ *  returns: True if successfull false otherwise
+ */
+bool CALLCONV SetProcessDataWatchdog(ecx_contextt * context, int slaveIndex, uint16_t watchdogTime)
+{
+    return write_watchdog_register(context, slaveIndex, WATCHDOG_TIME_PROCESS_DATA, watchdogTime);
+}
+
+static bool read_process_data_watchdog(ecx_contextt* context, uint16_t slaveIndex, uint16* out)
+{
+    int wkc = ecx_FPRD(context->port, context->slavelist[slaveIndex].configadr, WATCHDOG_TIME_PROCESS_DATA, sizeof(uint16), out, EC_TIMEOUTRET);
+    return wkc > 0;
+}
+
+static bool write_process_data_watchdog(ecx_contextt* context, uint16_t slaveIndex, uint16 val)
+{
+	if (!write_watchdog_register(context, slaveIndex, WATCHDOG_TIME_PROCESS_DATA, val))
+        return false;
+
+    // read-back
+    uint16 rd = 0;
+    int wkc = ecx_FPRD(context->port, context->slavelist[slaveIndex].configadr, WATCHDOG_TIME_PROCESS_DATA, sizeof(uint16), &rd, EC_TIMEOUTRET);
+
+    if (wkc <= 0 || rd != val) return false;
+
+    return true;
+}
+
+int CALLCONV RestoreProcessDataWatchdog(ecx_contextt* context)
+{
+    for (int slaveIndex = 1; slaveIndex < *context->slavecount + 1; slaveIndex++)
+    {
+        PdWdBackup* watchdog_backup = &pdwd_backup[slaveIndex];
+
+        if (watchdog_backup->saved == 0)
+			continue;
+
+        if (!write_process_data_watchdog(context, slaveIndex, watchdog_backup->value))
+            return -0x0105;
+    }
+
+    return 1;
+}
+
 int CALLCONV ScanDevices(ecx_contextt* context, char* interfaceName, ec_slave_info_t** slaveInfoSet, int* slaveCount)
 {
-    int wkc;
     int watchdogTime;
     int slaveIndex;
 
@@ -1085,24 +1364,25 @@ int CALLCONV ScanDevices(ecx_contextt* context, char* interfaceName, ec_slave_in
         *slaveCount = *context->slavecount;
 
         // request PREOP state for all slaves
-        int counter = 5;
+        int counter = 15;
+        uint16 PREOP_STATE_CHECK = check_ack_preop ? (EC_STATE_PRE_OP | EC_STATE_ACK) : EC_STATE_PRE_OP;
 
         do
         {
             ecx_statecheck(context, 0, EC_STATE_PRE_OP, EC_TIMEOUTSTATE);
-            
+
             for (int slaveIndex = 1; slaveIndex < *context->slavecount + 1; slaveIndex++)
             {
-                if(context->slavelist[slaveIndex].state != (EC_STATE_PRE_OP | EC_STATE_ACK))
+                if(context->slavelist[slaveIndex].state != PREOP_STATE_CHECK)
                 {
-                    context->slavelist[slaveIndex].state = EC_STATE_PRE_OP | EC_STATE_ACK;
+                    context->slavelist[slaveIndex].state = PREOP_STATE_CHECK;
                     ecx_writestate(context, slaveIndex);
                 }
             }
-            
-        } while (counter-- && (context->slavelist[0].state != (EC_STATE_PRE_OP | EC_STATE_ACK)));
 
-        if (context->slavelist[0].state != (EC_STATE_PRE_OP | EC_STATE_ACK))
+        } while (counter-- && (context->slavelist[0].state != PREOP_STATE_CHECK));
+
+        if (context->slavelist[0].state != PREOP_STATE_CHECK)
             return -0x0104;
 
         // read real CSA value from EEPROM
@@ -1122,17 +1402,21 @@ int CALLCONV ScanDevices(ecx_contextt* context, char* interfaceName, ec_slave_in
 
         for (int slaveIndex = 1; slaveIndex < *context->slavecount + 1; slaveIndex++)
         {
-            // clear watchdog trigger enable in SM control register
-            for (int i = 0; i < EC_MAXSM; i++)
-            {
-                if (context->slavelist[slaveIndex].SMtype[i] == 3)
-                    context->slavelist[slaveIndex].SM[i].SMflags &= ~0x40;
-            }
+            uint16 current_watchdog = 0;
 
-            // clear watchdog time process data register
-            if (!(wkc = ecx_FPWR(context->port, context->slavelist[slaveIndex].configadr, 0x420, sizeof(watchdogTime), &watchdogTime, EC_TIMEOUTRET)))
+			// check if watchdog time process data register was already backed up and cleared
+            if (pdwd_backup[slaveIndex].saved == 0)
             {
-                return -0x0102;
+                // read current watchdog time process data register
+                if (read_process_data_watchdog(context, slaveIndex, &current_watchdog))
+                {
+                    pdwd_backup[slaveIndex].saved = 1;
+                    pdwd_backup[slaveIndex].value = current_watchdog;
+                }
+
+                // clear watchdog time process data register
+                if (!write_process_data_watchdog(context, slaveIndex, 0))
+                    return -0x0102;
             }
 
             // copy relevant data
@@ -1233,7 +1517,7 @@ int CALLCONV UpdateIo(ecx_contextt* context, int64* dcTime)
     {
         wkc = ecx_receive_processdata(context, EC_TIMEOUTRET);
     }
-    
+
     *dcTime = *context->DCtime;
 
     return wkc;

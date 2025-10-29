@@ -7,7 +7,7 @@ image:
 
 environment:
   ApiKey:
-    secure: SeomICfFXAQobyK5uMGeAhb0uljBxicG4Z56pWxWCXA=
+    secure: 7Zs5sA5Xf8nBMwRpTa/vKpyDea/nW1MBYAmObl679uQ=
   SatelliteJobName: 'Image: Ubuntu'
   FileName: 'libsoem_wrapper.so'
 
@@ -82,22 +82,11 @@ artifacts:
 
 deploy:
 
-# MyGet (dev)
-  - provider: NuGet
-    server: https://www.myget.org/F/apollo3zehn-dev/api/v2/package
-    api_key:
-      secure: DVadlPknnKPMR4F2+3VqeU7BFFmtLcXDHzkySA590MqQNIdzbx8HRuaPwDVbHRqX
-    skip_symbols: true
-    artifact: /.*\.nupkg/ 
-    on:
-      branch: dev
-      CI_WINDOWS: true
-
 # NuGet (master)
   - provider: NuGet
     server: https://www.nuget.org/api/v2/package
     api_key:
-      secure: /+MsVllJKX6M/MHBmCXaBFf1ttNDSqO04J7frGM81UUgBwfDUs6Wn4WufiU0Wl3/
+      secure: 4y2X3oy8EjI61Aoep/fZ+njBv5A+nDAt0YfTpRKF0HZwEtkB7hcoTYWNvsxWG73R
     skip_symbols: true
     artifact: /.*\.nupkg/ 
     on:
